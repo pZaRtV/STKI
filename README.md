@@ -1,0 +1,2 @@
+# STKI
+Information Retrieval Project
