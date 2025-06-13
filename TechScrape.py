@@ -1,3 +1,7 @@
+#1. Moch. Udhay Yunussabil	                    163221004
+#2. Valiantino Ramandhika A.                    163221038
+#3. Patrick Andrasena Tumengkol                 163221077
+
 import pandas as pd
 import string
 import nltk
