@@ -9,7 +9,6 @@ import requests
 import json
 import os
 from datetime import datetime, timedelta
-import sqlite3
 from typing import List, Dict, Tuple
 import time
 import re
@@ -27,8 +26,8 @@ from collections import Counter, defaultdict
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from wordcloud import WordCloud
 import warnings
+from sklearn.decomposition import TruncatedSVD
 warnings.filterwarnings('ignore')
 
 # Download required NLTK data
@@ -49,67 +48,19 @@ class TechNewsIRSystem:
         # Technology-specific keywords for topic detection
         self.tech_topics = {
             'AI/ML': ['artificial intelligence', 'machine learning', 'deep learning', 'neural network', 
-                     'ai', 'ml', 'algorithm', 'automation', 'chatgpt', 'openai'],
+                     'ai', 'ml', 'chatgpt', 'openai', 'GGUF', 'LLM'],
             'Blockchain': ['blockchain', 'cryptocurrency', 'bitcoin', 'ethereum', 'crypto', 'defi', 
-                          'nft', 'web3', 'smart contract'],
+                          'nft', 'web3',],
             'Cloud Computing': ['cloud', 'aws', 'azure', 'google cloud', 'saas', 'paas', 'iaas', 
                                'serverless', 'kubernetes'],
             'Cybersecurity': ['cybersecurity', 'security', 'hack', 'breach', 'malware', 'ransomware', 
-                             'phishing', 'encryption'],
+                             'phishing', 'encryption', 'attack'],
             'Mobile Tech': ['mobile', 'smartphone', 'ios', 'android', 'app', 'mobile app', 'tablet'],
             'IoT': ['iot', 'internet of things', 'smart home', 'connected device', 'sensor'],
             'Data Science': ['data science', 'big data', 'analytics', 'data mining', 'visualization'],
             'Programming': ['python', 'javascript', 'java', 'programming', 'software development', 
-                           'coding', 'framework']
+                           'coding', 'framework'],
         }
-        
-        self.setup_database()
-        
-    def setup_database(self):
-        """Initialize SQLite database for storing search history and results"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        # Create tables
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS search_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                query TEXT NOT NULL,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                num_results INTEGER,
-                processing_time REAL
-            )
-        ''')
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS news_articles (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                search_id INTEGER,
-                title TEXT,
-                content TEXT,
-                url TEXT,
-                published_date DATETIME,
-                source TEXT,
-                topic_category TEXT,
-                relevance_score REAL,
-                sentiment_score REAL,
-                FOREIGN KEY (search_id) REFERENCES search_history (id)
-            )
-        ''')
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS query_expansions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                search_id INTEGER,
-                original_query TEXT,
-                expanded_query TEXT,
-                expansion_terms TEXT,
-                FOREIGN KEY (search_id) REFERENCES search_history (id)
-            )
-        ''')
-        
-        conn.commit()
-        conn.close()
         
     def preprocess_text(self, text: str) -> str:
         """Advanced text preprocessing for technology news"""
@@ -245,69 +196,96 @@ class TechNewsIRSystem:
     
     def fetch_tech_news(self, query: str, num_articles: int = 20) -> List[Dict]:
         """
-        Fetch real-time technology news from MIT Technology Review and Ars Technica
+        Fetch technology articles from Google Scholar
         """
-        all_articles = []
+        print("Fetching articles from Google Scholar...")
         
-        # RSS feeds for tech news sources
-        rss_feeds = {
-            'MIT Technology Review': 'https://www.technologyreview.com/feed/',
-            'Ars Technica': 'https://feeds.arstechnica.com/arstechnica/index'
-        }
+        # Fetch from Google Scholar
+        articles = self.fetch_google_scholar(query, num_articles)
         
-        print("Fetching articles from RSS feeds...")
-        
-        # Fetch from RSS feeds
-        for source, rss_url in rss_feeds.items():
-            print(f"Fetching from {source}...")
-            articles = self.fetch_rss_feed(rss_url, source)
+        # Sort by published date
+        articles.sort(key=lambda x: x['published_date'], reverse=True)
+        return articles[:num_articles]
+
+    def fetch_google_scholar(self, query: str, num_articles: int) -> List[Dict]:
+        """Fetch articles from Google Scholar"""
+        articles = []
+        try:
+            headers = {
+                'User-Agent': self.get_user_agent(),
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Referer': 'https://scholar.google.com/'
+            }
             
-            # Enhance articles with full content for better matching
-            for article in articles[:10]:  # Limit to avoid too many requests
-                if article['url'] and len(article['content']) < 500:  # Only scrape if content is short
-                    full_content = self.scrape_article_content(article['url'])
-                    if full_content:
-                        article['content'] = full_content
-                    
-                    # Add small delay to be respectful
-                    time.sleep(0.5)
+            # Construct search URL
+            search_url = f"https://scholar.google.com/scholar?q={query.replace(' ', '+')}&hl=en&as_sdt=0,5"
             
-            all_articles.extend(articles)
-        
-        # Filter articles based on query relevance if query is provided
-        if query and query.strip():
-            relevant_articles = []
-            query_terms = query.lower().split()
-            
-            for article in all_articles:
-                title_content = (article['title'] + ' ' + article['content']).lower()
-                # Check if any query term appears in title or content
-                relevance_score = sum(1 for term in query_terms if term in title_content)
+            response = requests.get(search_url, headers=headers, timeout=10)
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.content, 'html.parser')
                 
-                if relevance_score > 0:
-                    article['initial_relevance'] = relevance_score
-                    relevant_articles.append(article)
-            
-            # Sort by initial relevance and published date
-            relevant_articles.sort(key=lambda x: (x.get('initial_relevance', 0), x['published_date']), reverse=True)
-            return relevant_articles[:num_articles]
+                # Find all article entries
+                entries = soup.find_all('div', class_='gs_ri')
+                
+                for entry in entries[:num_articles]:
+                    title_elem = entry.find('h3', class_='gs_rt')
+                    if not title_elem:
+                        continue
+                        
+                    title = title_elem.get_text().strip()
+                    url = title_elem.find('a')['href'] if title_elem.find('a') else ''
+                    
+                    # Get publication info
+                    pub_info = entry.find('div', class_='gs_a')
+                    pub_text = pub_info.get_text() if pub_info else ''
+                    
+                    # Extract year from publication info
+                    year_match = re.search(r'\b(19|20)\d{2}\b', pub_text)
+                    year = int(year_match.group()) if year_match else datetime.now().year
+                    
+                    article = {
+                        'title': title,
+                        'content': pub_text,  # Using publication info as content
+                        'url': url,
+                        'published_date': datetime(year, 1, 1),  # Using year only
+                        'source': 'Google Scholar'
+                    }
+                    articles.append(article)
+                    
+                    # Add delay to avoid rate limiting
+                    time.sleep(2)
+                    
+        except Exception as e:
+            print(f"Error fetching from Google Scholar: {e}")
         
-        # If no query, return recent articles
-        all_articles.sort(key=lambda x: x['published_date'], reverse=True)
-        return all_articles[:num_articles]
-    
+        return articles
+
     def detect_topic_category(self, text: str) -> str:
-        """Detect the primary technology topic category"""
+        """Detect the primary technology topic category using weighted keyword scores."""
         text_lower = text.lower()
-        topic_scores = {}
-        
+        topic_scores = defaultdict(float)
+
         for topic, keywords in self.tech_topics.items():
-            score = sum(1 for keyword in keywords if keyword.lower() in text_lower)
+            score = 0
+            for keyword in keywords:
+                # Weight by the square of the number of words in the keyword
+                # This gives much higher scores to specific multi-word phrases
+                weight = len(keyword.split()) ** 2
+                
+                # Use regex with \b for word boundaries to ensure whole word/phrase matching
+                # and prevent partial matches (e.g., 'ai' in 'train').
+                # We use count of matches multiplied by weight.
+                matches = re.findall(r'\b' + re.escape(keyword.lower()) + r'\b', text_lower)
+                if matches:
+                    score += len(matches) * weight
+            
             if score > 0:
                 topic_scores[topic] = score
-        
+
         if topic_scores:
             return max(topic_scores, key=topic_scores.get)
+        
         return 'General Tech'
     
     def calculate_sentiment_score(self, text: str) -> float:
@@ -357,8 +335,276 @@ class TechNewsIRSystem:
         except:
             return query, []
     
-    def search_and_analyze(self, query: str, num_articles: int = 20) -> Dict:
-        """Main search function with comprehensive analysis"""
+    def track_title_categories(self, articles: List[Dict]) -> Dict[str, List[str]]:
+        """Track and categorize article titles"""
+        category_titles = defaultdict(list)
+        
+        for article in articles:
+            title = article['title']
+            category = article['topic_category']
+            category_titles[category].append(title)
+        
+        return dict(category_titles)
+
+    def analyze_title_trends(self, category_titles: Dict[str, List[str]]) -> Dict:
+        """Analyze trends in titles by category"""
+        analysis = {
+            'category_counts': {},
+            'common_terms': {},
+            'title_lengths': {}
+        }
+        
+        for category, titles in category_titles.items():
+            # Count titles per category
+            analysis['category_counts'][category] = len(titles)
+            
+            # Analyze common terms
+            all_terms = []
+            for title in titles:
+                terms = self.preprocess_text(title).split()
+                all_terms.extend(terms)
+            
+            term_freq = Counter(all_terms)
+            analysis['common_terms'][category] = dict(term_freq.most_common(10))
+            
+            # Analyze title lengths
+            lengths = [len(title.split()) for title in titles]
+            analysis['title_lengths'][category] = {
+                'mean': np.mean(lengths),
+                'median': np.median(lengths),
+                'min': min(lengths),
+                'max': max(lengths)
+            }
+        
+        return analysis
+
+    def create_category_analysis_table(self, all_category_titles: Dict[str, List[str]]) -> pd.DataFrame:
+        """Create a consolidated analysis table for all categories"""
+        analysis_data = []
+        
+        # Create directory for storing titles
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        titles_dir = f"category_titles_{timestamp}"
+        if not os.path.exists(titles_dir):
+            os.makedirs(titles_dir)
+        
+        for category, titles in all_category_titles.items():
+            # Calculate statistics
+            title_count = len(titles)
+            avg_length = np.mean([len(title.split()) for title in titles])
+            median_length = np.median([len(title.split()) for title in titles])
+            
+            # Get common terms
+            all_terms = []
+            for title in titles:
+                terms = self.preprocess_text(title).split()
+                all_terms.extend(terms)
+            
+            term_freq = Counter(all_terms)
+            top_terms = dict(term_freq.most_common(5))
+            
+            # Save titles to file
+            category_filename = os.path.join(titles_dir, f"{category.lower().replace('/', '_')}_titles.txt")
+            with open(category_filename, 'w', encoding='utf-8') as f:
+                f.write(f"Category: {category}\n")
+                f.write(f"Total Titles: {title_count}\n")
+                f.write(f"Average Title Length: {avg_length:.2f}\n")
+                f.write(f"Median Title Length: {median_length:.2f}\n")
+                f.write("\nTop Terms:\n")
+                for term, count in top_terms.items():
+                    f.write(f"- {term}: {count}\n")
+                f.write("\nTitles:\n")
+                f.write("="*80 + "\n")
+                for title in titles:
+                    f.write(f"{title}\n")
+            
+            # Add to analysis data
+            analysis_data.append({
+                'Category': category,
+                'Title Count': title_count,
+                'Avg Title Length': round(avg_length, 2),
+                'Median Title Length': round(median_length, 2),
+                'Top Terms': ', '.join(f"{term}({count})" for term, count in top_terms.items())
+            })
+        
+        # Create DataFrame
+        df = pd.DataFrame(analysis_data)
+        return df.sort_values('Title Count', ascending=False), titles_dir
+
+    def create_category_visualizations(self, analysis_table: pd.DataFrame, titles_dir: str):
+        """Create visualizations for category analysis"""
+        # Create directory for visualizations
+        viz_dir = os.path.join(titles_dir, "visualizations")
+        if not os.path.exists(viz_dir):
+            os.makedirs(viz_dir)
+        
+        # 1. Title Count Distribution
+        plt.figure(figsize=(12, 6))
+        sns.barplot(data=analysis_table, x='Category', y='Title Count')
+        plt.title('Distribution of Titles by Category')
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout()
+        plt.savefig(os.path.join(viz_dir, 'title_count_distribution.png'))
+        plt.close()
+        
+        # 2. Title Length Analysis
+        plt.figure(figsize=(12, 6))
+        sns.barplot(data=analysis_table, x='Category', y='Avg Title Length')
+        plt.title('Average Title Length by Category')
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout()
+        plt.savefig(os.path.join(viz_dir, 'title_length_analysis.png'))
+        plt.close()
+        
+        # 3. Title Length vs Count Scatter Plot
+        plt.figure(figsize=(10, 6))
+        plt.scatter(analysis_table['Avg Title Length'], analysis_table['Title Count'], 
+                   s=analysis_table['Title Count']*2, alpha=0.6)
+        
+        # Add labels for each point
+        for i, row in analysis_table.iterrows():
+            plt.annotate(row['Category'], 
+                        (row['Avg Title Length'], row['Title Count']),
+                        xytext=(5, 5), textcoords='offset points')
+        
+        plt.title('Relationship between Title Length and Count')
+        plt.xlabel('Average Title Length')
+        plt.ylabel('Number of Titles')
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.tight_layout()
+        plt.savefig(os.path.join(viz_dir, 'title_length_vs_count.png'))
+        plt.close()
+        
+        # 4. Category Distribution Pie Chart
+        plt.figure(figsize=(10, 10))
+        plt.pie(analysis_table['Title Count'], 
+                labels=analysis_table['Category'],
+                autopct='%1.1f%%',
+                startangle=90)
+        plt.title('Category Distribution')
+        plt.axis('equal')
+        plt.tight_layout()
+        plt.savefig(os.path.join(viz_dir, 'category_distribution_pie.png'))
+        plt.close()
+
+    def create_additional_visualizations(self, csv_path: str, titles_dir: str):
+        """Create additional visualizations from the CSV data"""
+        # Read the CSV data
+        df = pd.read_csv(csv_path)
+        
+        # Create directory for additional visualizations
+        additional_viz_dir = os.path.join(titles_dir, "additional_visualizations")
+        if not os.path.exists(additional_viz_dir):
+            os.makedirs(additional_viz_dir)
+        
+        # 1. Title Count Distribution with Trend Line
+        plt.figure(figsize=(15, 7))
+        plt.bar(df['Category'], df['Title Count'], color='skyblue', alpha=0.7)
+        plt.plot(df['Category'], df['Title Count'], 'r--', alpha=0.5)
+        plt.title('Title Count Distribution with Trend Line')
+        plt.xlabel('Category')
+        plt.ylabel('Number of Titles')
+        plt.xticks(rotation=45, ha='right')
+        plt.grid(True, linestyle='--', alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(additional_viz_dir, 'title_count_trend.png'))
+        plt.close()
+        
+        # 2. Title Length Comparison
+        plt.figure(figsize=(15, 7))
+        x = np.arange(len(df['Category']))
+        width = 0.35
+        
+        plt.bar(x - width/2, df['Avg Title Length'], width, label='Average Length', color='lightgreen')
+        plt.bar(x + width/2, df['Median Title Length'], width, label='Median Length', color='lightblue')
+        
+        plt.xlabel('Category')
+        plt.ylabel('Title Length')
+        plt.title('Average vs Median Title Length by Category')
+        plt.xticks(x, df['Category'], rotation=45, ha='right')
+        plt.legend()
+        plt.grid(True, linestyle='--', alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(additional_viz_dir, 'title_length_comparison.png'))
+        plt.close()
+        
+        # 3. Category Distribution Heatmap
+        plt.figure(figsize=(12, 8))
+        # Create a correlation matrix of title counts and lengths
+        corr_matrix = df[['Title Count', 'Avg Title Length', 'Median Title Length']].corr()
+        sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', vmin=-1, vmax=1)
+        plt.title('Correlation Matrix of Title Metrics')
+        plt.tight_layout()
+        plt.savefig(os.path.join(additional_viz_dir, 'correlation_heatmap.png'))
+        plt.close()
+        
+        # 4. Title Length Distribution Box Plot
+        plt.figure(figsize=(15, 7))
+        data_to_plot = []
+        labels = []
+        for _, row in df.iterrows():
+            # Create synthetic data based on mean and median
+            data = np.random.normal(row['Avg Title Length'], 
+                                  row['Avg Title Length'] * 0.2, 
+                                  int(row['Title Count']))
+            data_to_plot.append(data)
+            labels.append(row['Category'])
+        
+        plt.boxplot(data_to_plot, labels=labels)
+        plt.title('Title Length Distribution by Category')
+        plt.xlabel('Category')
+        plt.ylabel('Title Length')
+        plt.xticks(rotation=45, ha='right')
+        plt.grid(True, linestyle='--', alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(additional_viz_dir, 'title_length_boxplot.png'))
+        plt.close()
+        
+        # 5. Category Distribution with Percentage
+        plt.figure(figsize=(12, 8))
+        total_titles = df['Title Count'].sum()
+        percentages = (df['Title Count'] / total_titles * 100).round(1)
+        
+        plt.pie(df['Title Count'], 
+                labels=[f"{cat}\n({pct}%)" for cat, pct in zip(df['Category'], percentages)],
+                autopct='%1.1f%%',
+                startangle=90,
+                shadow=True,
+                explode=[0.05] * len(df))  # Slight separation between slices
+        
+        plt.title('Category Distribution with Percentages')
+        plt.axis('equal')
+        plt.tight_layout()
+        plt.savefig(os.path.join(additional_viz_dir, 'category_distribution_percentage.png'))
+        plt.close()
+        
+        # 6. Title Length vs Count Scatter with Regression
+        plt.figure(figsize=(12, 8))
+        plt.scatter(df['Avg Title Length'], df['Title Count'], 
+                   s=df['Title Count']*2, alpha=0.6, c='blue')
+        
+        # Add regression line
+        z = np.polyfit(df['Avg Title Length'], df['Title Count'], 1)
+        p = np.poly1d(z)
+        plt.plot(df['Avg Title Length'], p(df['Avg Title Length']), 
+                "r--", alpha=0.8)
+        
+        # Add labels for each point
+        for i, row in df.iterrows():
+            plt.annotate(row['Category'], 
+                        (row['Avg Title Length'], row['Title Count']),
+                        xytext=(5, 5), textcoords='offset points')
+        
+        plt.title('Title Length vs Count with Regression Line')
+        plt.xlabel('Average Title Length')
+        plt.ylabel('Number of Titles')
+        plt.grid(True, linestyle='--', alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(additional_viz_dir, 'title_length_vs_count_regression.png'))
+        plt.close()
+
+    def search_and_analyze(self, query: str, num_articles: int = 20, num_clusters: int = None) -> Dict:
+        """Main search function with comprehensive analysis, now with LSA+KMeans clustering for categorization"""
         start_time = time.time()
         
         # Fetch articles
@@ -370,12 +616,10 @@ class TechNewsIRSystem:
         # Process articles
         processed_articles = []
         all_texts = []
-        
         for article in articles:
             processed_content = self.preprocess_text(article['title'] + ' ' + article['content'])
             topic_category = self.detect_topic_category(article['title'] + ' ' + article['content'])
             sentiment_score = self.calculate_sentiment_score(article['title'] + ' ' + article['content'])
-            
             processed_article = {
                 **article,
                 'processed_content': processed_content,
@@ -385,24 +629,50 @@ class TechNewsIRSystem:
             processed_articles.append(processed_article)
             all_texts.append(processed_content)
         
+        # Set default number of clusters to number of main tech topics
+        if num_clusters is None:
+            num_clusters = len(self.tech_topics)
+        
+        # LSA + KMeans clustering on processed article texts
+        cluster_labels = None
+        if all_texts and any(text.strip() for text in all_texts):
+            try:
+                tfidf_matrix = self.vectorizer_tfidf.fit_transform(all_texts)
+                # LSA dimensionality reduction
+                n_components = min(100, tfidf_matrix.shape[1] - 1) if tfidf_matrix.shape[1] > 1 else 1
+                lsa = TruncatedSVD(n_components=n_components, random_state=42)
+                lsa_matrix = lsa.fit_transform(tfidf_matrix)
+                # KMeans clustering on LSA-reduced features
+                kmeans = KMeans(n_clusters=num_clusters, random_state=42, n_init=10)
+                cluster_labels = kmeans.fit_predict(lsa_matrix)
+                # Assign cluster label to each article
+                for i, article in enumerate(processed_articles):
+                    article['cluster_label'] = int(cluster_labels[i])
+            except Exception as e:
+                print(f"Error in LSA+KMeans clustering: {e}")
+                for article in processed_articles:
+                    article['cluster_label'] = -1
+        else:
+            for article in processed_articles:
+                article['cluster_label'] = -1
+        
+        # Track and analyze titles by category (original, keyword-based)
+        category_titles = self.track_title_categories(processed_articles)
+        title_analysis = self.analyze_title_trends(category_titles)
+        
         # Calculate TF-IDF and relevance scores
         if all_texts and any(text.strip() for text in all_texts):
             try:
                 tfidf_matrix = self.vectorizer_tfidf.fit_transform(all_texts)
-                
                 # Process query
                 processed_query = self.preprocess_text(query)
                 query_vector = self.vectorizer_tfidf.transform([processed_query])
-                
                 # Calculate cosine similarity
                 similarities = cosine_similarity(tfidf_matrix, query_vector).flatten()
-                
                 for i, article in enumerate(processed_articles):
                     article['relevance_score'] = float(similarities[i])
-                
                 # Sort by relevance
                 processed_articles.sort(key=lambda x: x['relevance_score'], reverse=True)
-                
             except Exception as e:
                 print(f"Error in TF-IDF calculation: {e}")
                 for article in processed_articles:
@@ -413,61 +683,28 @@ class TechNewsIRSystem:
         
         processing_time = time.time() - start_time
         
-        # Store in database
-        search_id = self.store_search_results(query, processed_articles, processing_time, 
-                                            expanded_query, expansion_terms)
-        
         # Generate analysis
         analysis = self.generate_analysis(processed_articles)
+        analysis['title_analysis'] = title_analysis
+        
+        # Also group articles by cluster for possible downstream use
+        cluster_titles = defaultdict(list)
+        for article in processed_articles:
+            cluster = article.get('cluster_label', -1)
+            cluster_titles[cluster].append(article['title'])
         
         return {
-            'search_id': search_id,
             'query': query,
             'expanded_query': expanded_query,
             'expansion_terms': expansion_terms,
             'num_results': len(processed_articles),
             'processing_time': processing_time,
             'articles': processed_articles,
-            'analysis': analysis
+            'analysis': analysis,
+            'category_titles': category_titles,
+            'cluster_titles': dict(cluster_titles),
+            'num_clusters': num_clusters
         }
-    
-    def store_search_results(self, query: str, articles: List[Dict], processing_time: float,
-                           expanded_query: str, expansion_terms: List[str]) -> int:
-        """Store search results in local database"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        # Insert search history
-        cursor.execute('''
-            INSERT INTO search_history (query, num_results, processing_time)
-            VALUES (?, ?, ?)
-        ''', (query, len(articles), processing_time))
-        
-        search_id = cursor.lastrowid
-        
-        # Insert articles
-        for article in articles:
-            cursor.execute('''
-                INSERT INTO news_articles 
-                (search_id, title, content, url, published_date, source, topic_category, 
-                 relevance_score, sentiment_score)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                search_id, article['title'], article['content'], article['url'],
-                article['published_date'], article['source'], article['topic_category'],
-                article.get('relevance_score', 0.0), article.get('sentiment_score', 0.0)
-            ))
-        
-        # Insert query expansion
-        cursor.execute('''
-            INSERT INTO query_expansions (search_id, original_query, expanded_query, expansion_terms)
-            VALUES (?, ?, ?, ?)
-        ''', (search_id, query, expanded_query, ','.join(expansion_terms)))
-        
-        conn.commit()
-        conn.close()
-        
-        return search_id
     
     def generate_analysis(self, articles: List[Dict]) -> Dict:
         """Generate comprehensive analysis of retrieved articles"""
@@ -501,29 +738,6 @@ class TechNewsIRSystem:
             'total_articles': len(articles)
         }
     
-    def get_search_history(self, limit: int = 10) -> List[Dict]:
-        """Retrieve recent search history"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT id, query, timestamp, num_results, processing_time
-            FROM search_history
-            ORDER BY timestamp DESC
-            LIMIT ?
-        ''', (limit,))
-        
-        results = []
-        for row in cursor.fetchall():
-            results.append({
-                'search_id': row[0],
-                'query': row[1],
-                'timestamp': row[2],
-                'num_results': row[3],
-                'processing_time': row[4]
-            })
-        
-        conn.close()
     def get_trending_topics(self) -> List[Dict]:
         """Get trending topics from recent articles"""
         print("Analyzing trending topics...")
@@ -582,6 +796,7 @@ class TechNewsIRSystem:
         articles = search_results['articles']
         analysis = search_results['analysis']
         query = search_results['query']
+        category_titles = search_results.get('category_titles', {})
         
         # Create timestamp and directory for this runtime
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -607,7 +822,56 @@ class TechNewsIRSystem:
             plt.savefig(os.path.join(runtime_dir, f"{base_filename}_topic_distribution.png"))
             plt.close()
         
-        # 2. Sentiment Distribution Plot
+        # 2. Title Analysis Visualizations
+        if category_titles:
+            # 2.1 Title Length Distribution by Category
+            plt.figure(figsize=(12, 6))
+            title_lengths = []
+            categories = []
+            for category, titles in category_titles.items():
+                lengths = [len(title.split()) for title in titles]
+                title_lengths.extend(lengths)
+                categories.extend([category] * len(lengths))
+            
+            sns.boxplot(x=categories, y=title_lengths)
+            plt.title(f'Title Length Distribution by Category for Query: "{query}"')
+            plt.xlabel('Category')
+            plt.ylabel('Number of Words in Title')
+            plt.xticks(rotation=45, ha='right')
+            plt.tight_layout()
+            plt.savefig(os.path.join(runtime_dir, f"{base_filename}_title_lengths.png"))
+            plt.close()
+            
+            # 2.2 Common Terms by Category
+            if analysis.get('title_analysis', {}).get('common_terms'):
+                plt.figure(figsize=(15, 8))
+                common_terms = analysis['title_analysis']['common_terms']
+                
+                # Create a heatmap of term frequencies
+                terms = set()
+                for category_terms in common_terms.values():
+                    terms.update(category_terms.keys())
+                
+                term_matrix = np.zeros((len(common_terms), len(terms)))
+                term_list = list(terms)
+                
+                for i, (category, terms_dict) in enumerate(common_terms.items()):
+                    for j, term in enumerate(term_list):
+                        term_matrix[i, j] = terms_dict.get(term, 0)
+                
+                sns.heatmap(term_matrix, 
+                          xticklabels=term_list,
+                          yticklabels=list(common_terms.keys()),
+                          cmap='YlOrRd')
+                plt.title(f'Common Terms by Category for Query: "{query}"')
+                plt.xlabel('Terms')
+                plt.ylabel('Category')
+                plt.xticks(rotation=45, ha='right')
+                plt.tight_layout()
+                plt.savefig(os.path.join(runtime_dir, f"{base_filename}_common_terms.png"))
+                plt.close()
+        
+        # 3. Sentiment Distribution Plot
         plt.figure(figsize=(10, 6))
         sentiments = [article.get('sentiment_score', 0.0) for article in articles]
         plt.hist(sentiments, bins=10, color='lightgreen', alpha=0.7)
@@ -617,19 +881,6 @@ class TechNewsIRSystem:
         plt.axvline(x=0, color='red', linestyle='--', alpha=0.5)
         plt.tight_layout()
         plt.savefig(os.path.join(runtime_dir, f"{base_filename}_sentiment_distribution.png"))
-        plt.close()
-        
-        # 3. Relevance Scores Plot
-        plt.figure(figsize=(12, 8))
-        relevance_scores = [article.get('relevance_score', 0.0) for article in articles]
-        article_titles = [article['title'][:30] + '...' if len(article['title']) > 30 
-                         else article['title'] for article in articles[:10]]
-        plt.barh(range(len(article_titles)), relevance_scores[:10], color='orange')
-        plt.yticks(range(len(article_titles)), article_titles, fontsize=8)
-        plt.title(f'Top 10 Articles by Relevance for Query: "{query}"')
-        plt.xlabel('Relevance Score')
-        plt.tight_layout()
-        plt.savefig(os.path.join(runtime_dir, f"{base_filename}_relevance_scores.png"))
         plt.close()
         
         # 4. Source Distribution Plot
@@ -643,22 +894,6 @@ class TechNewsIRSystem:
             plt.savefig(os.path.join(runtime_dir, f"{base_filename}_source_distribution.png"))
             plt.close()
         
-        # 5. Word Cloud Plot
-        if articles:
-            top_articles_text = ' '.join([article['title'] + ' ' + article['content'] 
-                                        for article in articles[:5]])
-            processed_text = self.preprocess_text(top_articles_text)
-            
-            if processed_text:
-                plt.figure(figsize=(12, 6))
-                wordcloud = WordCloud(width=800, height=400, background_color='white').generate(processed_text)
-                plt.imshow(wordcloud, interpolation='bilinear')
-                plt.axis('off')
-                plt.title(f'Word Cloud of Top Articles for Query: "{query}"')
-                plt.tight_layout()
-                plt.savefig(os.path.join(runtime_dir, f"{base_filename}_wordcloud.png"))
-                plt.close()
-        
         # Save analysis summary and article details to a text file
         summary_file = os.path.join(runtime_dir, f"{base_filename}_summary.txt")
         with open(summary_file, 'w') as f:
@@ -669,6 +904,24 @@ class TechNewsIRSystem:
             f.write(f"Average Sentiment: {analysis.get('average_sentiment', 0):.3f}\n")
             f.write(f"Recent Articles (24h): {analysis.get('recent_articles_count', 0)}\n")
             f.write(f"Topics Found: {list(analysis.get('topic_distribution', {}).keys())}\n\n")
+            
+            # Add title analysis
+            if analysis.get('title_analysis'):
+                f.write("="*80 + "\n")
+                f.write("TITLE ANALYSIS\n")
+                f.write("="*80 + "\n\n")
+                
+                for category, stats in analysis['title_analysis']['category_counts'].items():
+                    f.write(f"Category: {category}\n")
+                    f.write(f"Number of Titles: {stats}\n")
+                    f.write(f"Common Terms: {dict(analysis['title_analysis']['common_terms'][category])}\n")
+                    f.write(f"Title Length Statistics:\n")
+                    length_stats = analysis['title_analysis']['title_lengths'][category]
+                    f.write(f"  Mean: {length_stats['mean']:.1f}\n")
+                    f.write(f"  Median: {length_stats['median']:.1f}\n")
+                    f.write(f"  Min: {length_stats['min']}\n")
+                    f.write(f"  Max: {length_stats['max']}\n")
+                    f.write("\n")
             
             # Add article details
             f.write("="*80 + "\n")
@@ -682,7 +935,7 @@ class TechNewsIRSystem:
                 f.write(f"Article {i}:\n")
                 f.write(f"Title: {article['title']}\n")
                 f.write(f"Source: {article['source']}\n")
-                f.write(f"Published: {article['published_date'].strftime('%Y-%m-%d %H:%M')}\n")
+                f.write(f"Published: {article['published_date'].strftime('%Y-%m-%d')}\n")
                 f.write(f"Topic: {article['topic_category']}\n")
                 f.write(f"Relevance Score: {article.get('relevance_score', 0):.3f}\n")
                 f.write(f"Sentiment Score: {article.get('sentiment_score', 0):.3f}\n")
@@ -691,36 +944,30 @@ class TechNewsIRSystem:
         
         print(f"\nVisualizations and analysis have been saved in directory: {runtime_dir}")
 
+    def final_segment_titles(self, all_titles: list) -> dict:
+        """Assign each title to its best-matching category using detect_topic_category (best match only)."""
+        final_categorized = defaultdict(list)
+        for title, _ in all_titles:
+            best_category = self.detect_topic_category(title)
+            final_categorized[best_category].append(title)
+        return final_categorized
+
 # Example usage and demonstration
 def main():
-    """Demonstrate the Real-Time Technology News IR System with RSS/Scraping"""
-    print("Initializing Real-Time Technology News IR System...")
-    print("Using RSS feeds and web scraping from:")
-    print("   • MIT Technology Review")
-    print("   • Ars Technica")
+    """Demonstrate the Technology News IR System with Google Scholar"""
+    print("Initializing Technology News IR System...")
+    print("Using web scraping from Google Scholar")
     print()
     
     ir_system = TechNewsIRSystem()
     
-    # Get trending topics first
-    print(" Analyzing current trending topics...")
-    trending = ir_system.get_trending_topics()
-    if trending:
-        print("\n Current Trending Topics:")
-        for i, topic in enumerate(trending[:10], 1):
-            print(f"   {i}. {topic['term']} ({topic['category']}) - Score: {topic['score']:.3f}")
+    # Dictionary to store all category titles
+    all_category_titles = defaultdict(list)
     
     # Example queries based on current tech topics
-    queries = [
-        "artificial intelligence",
-        "cybersecurity",
-        "quantum computing",
-        "machine learning",
-        "blockchain"
-    ]
-    
+    queries = list(ir_system.tech_topics.keys(),)
     print(f"\n{'='*80}")
-    print(" PERFORMING SEARCH QUERIES")
+    print("PERFORMING SEARCH QUERIES FOR MAIN CATEGORIES")
     print('='*80)
     
     for i, query in enumerate(queries, 1):
@@ -731,62 +978,67 @@ def main():
         results = ir_system.search_and_analyze(query, num_articles=15)
         
         if 'error' in results:
-            print(f" Error: {results['error']}")
+            print(f"Error: {results['error']}")
             continue
         
         # Display results summary
-        print(f" Query: {results['query']}")
-        print(f" Expanded Query: {results['expanded_query']}")
-        print(f"  Processing Time: {results['processing_time']:.2f} seconds")
-        print(f" Number of Results: {results['num_results']}")
+        print(f"Query: {results['query']}")
+        print(f"Expanded Query: {results['expanded_query']}")
+        print(f"Processing Time: {results['processing_time']:.2f} seconds")
+        print(f"Number of Results: {results['num_results']}")
         
-        if results['num_results'] > 0:
-            print(f"\n Top 3 Most Relevant Articles:")
-            for j, article in enumerate(results['articles'][:3], 1):
-                print(f"\n   {j}.  {article['title'][:80]}{'...' if len(article['title']) > 80 else ''}")
-                print(f"       Source: {article['source']}")
-                print(f"       Topic: {article['topic_category']}")
-                print(f"       Relevance: {article.get('relevance_score', 0):.3f}")
-                print(f"       Sentiment: {article.get('sentiment_score', 0):.3f}")
-                print(f"       Published: {article['published_date'].strftime('%Y-%m-%d %H:%M')}")
-                print(f"       URL: {article['url'][:60]}{'...' if len(article['url']) > 60 else ''}")
-            
-            print(f"\n Analysis Summary:")
-            analysis = results['analysis']
-            print(f"    Average Relevance: {analysis.get('average_relevance', 0):.3f}")
-            print(f"    Average Sentiment: {analysis.get('average_sentiment', 0):.3f}")
-            print(f"    Recent Articles (24h): {analysis.get('recent_articles_count', 0)}")
-            print(f"     Topics Found: {list(analysis.get('topic_distribution', {}).keys())}")
-            
-            # Create visualizations for the first few queries
-            if i <= 2:  # Only visualize first 2 queries to avoid too many plots
-                print(f"   Generating visualizations...")
-                ir_system.visualize_results(results)
-        else:
-            print("   No relevant articles found for this query.")
+        # Accumulate category titles
+        for category, titles in results['category_titles'].items():
+            all_category_titles[category].extend(titles)
         
         # Add delay between queries to be respectful to servers
         if i < len(queries):
-            time.sleep(2)
+            time.sleep(5)
     
-    # Show search history
+    # FINAL SEGMENTATION: Assign each title to its best-matching category and write to .txt files
     print(f"\n{'='*80}")
-    print(" RECENT SEARCH HISTORY")
+    print("FINAL SEGMENTATION OF TITLES INTO BEST-MATCH CATEGORIES")
     print('='*80)
-    history = ir_system.get_search_history(limit=10)
-    if history:
-        for i, search in enumerate(history, 1):
-            print(f"{i:2d}. 🔍 '{search['query']}' | "
-                  f" {search['num_results']} results | "
-                  f" {search['processing_time']:.2f}s | "
-                  f" {search['timestamp']}")
-    else:
-        print("No search history found.")
+    all_titles = []
+    for category, titles in all_category_titles.items():
+        for title in titles:
+            all_titles.append((title, category))
+    final_categorized_titles = ir_system.final_segment_titles(all_titles)
+    output_dir = "final_categorized_titles"
+    os.makedirs(output_dir, exist_ok=True)
+    for category, titles in final_categorized_titles.items():
+        filename = os.path.join(output_dir, f"{category.lower().replace('/', '_')}_titles.txt")
+        with open(filename, "w", encoding="utf-8") as f:
+            for title in titles:
+                f.write(title + "\n")
+    print(f"Final categorized titles have been saved in: {output_dir}")
+    
+    # Create consolidated analysis table
+    print(f"\n{'='*80}")
+    print("CONSOLIDATED CATEGORY ANALYSIS")
+    print('='*80)
+    
+    analysis_table, titles_dir = ir_system.create_category_analysis_table(all_category_titles)
+    print("\nCategory Analysis Table:")
+    print(analysis_table.to_string(index=False))
+    
+    # Create visualizations
+    print("\nCreating category visualizations...")
+    ir_system.create_category_visualizations(analysis_table, titles_dir)
+    
+    # Save analysis table to CSV
+    csv_filename = os.path.join(titles_dir, "category_analysis.csv")
+    analysis_table.to_csv(csv_filename, index=False)
+    print(f"\nAnalysis table has been saved to: {csv_filename}")
+    
+    # Create additional visualizations from CSV data
+    print("\nCreating additional visualizations from CSV data...")
+    ir_system.create_additional_visualizations(csv_filename, titles_dir)
+    
+    print(f"Category titles and visualizations have been saved in: {titles_dir}")
     
     print(f"\n{'='*80}")
     print("SYSTEM DEMONSTRATION COMPLETE")
-    print(f"All search data has been stored in: {ir_system.db_path}")
-    print("You can now search for any technology topic!")
     print('='*80)
 
 if __name__ == "__main__":
